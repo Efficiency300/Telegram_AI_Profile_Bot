@@ -1,0 +1,253 @@
+from telethon import TelegramClient , events
+import openai
+import json
+import base64
+import requests
+import os
+from pathlib import Path
+
+API_ID = 
+API_HASH = ''
+client = TelegramClient('session_name', API_ID, API_HASH)
+API_KEY_OPENAI = ''  # Замените на ваш актуальный API-ключ
+ASSIST_ID = ""
+
+
+
+
+async def handle_new_messages(event: events.NewMessage.Event) -> None:
+    chat_id = event.chat_id
+    sender = event.sender_id
+    message_text = event.message.message
+
+    await process_chat_events(chat_id, sender, message_text, event)
+
+async def process_chat_events(chat_id: int, sender: int, message_text: str, event: events.NewMessage.Event) -> None:
+    folder_path = 'photos'
+
+    # Получаем список всех файлов в папке
+    file_list = [f for f in os.listdir(folder_path) if f.endswith(('.jpg', '.jpeg', '.png'))]
+    print(f"Available photos: {file_list}")  # Debugging line
+
+    # Используем OpenAI для анализа и сопоставления описания товара с фотографиями
+    similar_photo = await find_similar_photo(message_text, file_list)
+
+    if similar_photo:
+        photo_path = os.path.join(folder_path, similar_photo)
+        print(f"Selected photo path: {photo_path}")  # Debugging line
+        await send_photo(chat_id, photo_path)
+
+    if event.message.media:
+        if hasattr(event.message.media, 'photo'):
+            await process_image(event.message.media.photo, chat_id)
+            return
+
+    async with client.action(chat_id, 'typing'):
+        chat_info = f"Новое сообщение из чата {chat_id} от {sender}: {message_text}"
+        print(chat_info)
+
+        try:
+            response = await thread(message_text)
+            await send_messages(chat_id, response)
+        except Exception as e:
+            print(f"Ошибка при обработке сообщения: {e}")
+
+    if event.message.media:
+        if hasattr(event.message.media, 'voice'):
+            transcription = await process_voice_message(event.message.media, chat_id)
+            if transcription:  # Проверяем, успешна ли транскрипция
+                response = await thread(transcription)  # Передаем транскрипцию в функцию thread
+
+
+                # Получаем аудиофайл на основе ответа
+                audio_file_path = await generate_speech(response)  # Генерируем голосовое сообщение
+
+                # Отправляем голосовое сообщение обратно в чат
+                await send_voice_message(chat_id, audio_file_path)
+            return  # Прекращаем выполнение после обработки голосового сообщения
+
+async def process_image(photo, chat_id: int) -> None:
+    file = await client.download_media(photo)
+
+    with open(file, "rb") as image_file:
+        base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {API_KEY_OPENAI}"
+    }
+
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Что изображено на этом фото?"
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        }
+                    }
+                ]
+            }
+        ],
+    }
+
+    response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
+
+    if response.status_code == 200:
+        image_response = response.json()
+        answer = image_response['choices'][0]['message']['content']
+        await send_messages(chat_id, answer)
+    else:
+        await send_messages(chat_id, "Не удалось получить информацию об изображении.")
+
+async def find_similar_photo(message_text: str, file_list: list) -> str:
+    openai.api_key = API_KEY_OPENAI
+    client = openai.OpenAI(api_key=API_KEY_OPENAI)
+
+    thread = client.beta.threads.create()
+    thread_id = thread.id
+
+    try:
+        # Формируем список запросов с названиями фотографий
+        formatted_file_list = [f.replace('.jpg', '') for f in file_list]
+        print(f"Formatted file list: {', '.join(formatted_file_list)}")  # Debugging line
+
+        client.beta.threads.messages.create(
+            thread_id=thread_id,
+            role="user",
+            content=message_text
+        )
+
+        run = client.beta.threads.runs.create_and_poll(
+            thread_id=thread_id,
+            model="gpt-4o",
+            assistant_id=ASSIST_ID,
+            instructions=f"твоя задача просто возвращять эти данные == {', '.join(formatted_file_list)} по примерному описанию пользователя возврящяй только эти данные и ничего более"
+
+
+        )
+
+        messages = client.beta.threads.messages.list(thread_id=thread_id)
+        message_source = json.loads(messages.model_dump_json())
+        answer_photos = message_source['data'][0]['content'][0]['text']['value']
+
+        # Split the response into a list and format it
+        photo_names = [name.strip() + '.jpg' for name in answer_photos.split(',') if
+                       name.strip() in formatted_file_list]
+
+        # Join the valid photo names into a single string separated by commas
+        return ', '.join(photo_names)
+
+    except Exception as e:
+        print(f"Ошибка при поиске фотографии: {e}")
+        return None
+
+async def send_photo(chat_id: int, photo_path: str) -> None:
+    try:
+        if os.path.exists(photo_path):
+            await client.send_file(chat_id, photo_path)
+            print(f'Фото отправлено в чат {chat_id}: {photo_path}')
+        else:
+            print(f'Фото не найдено по пути: {photo_path}')
+    except Exception as e:
+        print(f"Ошибка при отправке фото: {e}")
+
+async def generate_speech(text: str) -> str:
+    openai.api_key = API_KEY_OPENAI
+    client_openai = openai.OpenAI(api_key=API_KEY_OPENAI)
+
+    # Путь к файлу для сохранения аудиофайла
+    audio_file_path = Path(__file__).parent / "speech.mp3"
+
+    # Запрос к OpenAI для генерации речи
+    response = client_openai.audio.speech.create(
+        model="tts-1",
+        voice="alloy",
+        input=text
+    )
+
+    # Сохраняем аудио в файл
+    with open(audio_file_path, 'wb') as audio_file:
+        audio_file.write( response.read())  # Используем await для получения данных
+
+    return str(audio_file_path)
+
+async def process_voice_message(voice, chat_id: int) -> str:
+    openai.api_key = API_KEY_OPENAI
+    client_openai = openai.OpenAI(api_key=API_KEY_OPENAI)
+    file = await client.download_media(voice)
+
+    # Загружаем аудиофайл для транскрипции
+    with open(file, 'rb') as audio_file:
+        transcription = client_openai.audio.transcriptions.create(
+            model="whisper-1",
+            response_format="text",
+            file=audio_file,
+        )
+
+    # Удаляем аудиофайл после транскрипции
+    os.remove(file)
+
+    # Проверяем, что мы получили от API
+    print(transcription)  # Печать ответа для отладки
+    return transcription
+
+async def send_voice_message(chat_id: int, audio_file_path: str) -> None:
+    try:
+        # Отправляем голосовое сообщение в формате voice message
+        await client.send_file(chat_id, audio_file_path, voice_note=True)
+    except Exception as e:
+        print(f"Ошибка при отправке голосового сообщения: {e}")
+
+async def thread(message_text: str) -> str:
+    openai.api_key = API_KEY_OPENAI
+    client = openai.OpenAI(api_key=API_KEY_OPENAI)
+
+    thread = client.beta.threads.create()
+    thread_id = thread.id
+
+    client.beta.threads.messages.create(
+        thread_id=thread_id,
+        role="user",
+        content=message_text
+    )
+
+    run = client.beta.threads.runs.create_and_poll(
+        thread_id=thread_id,
+        model="gpt-4o",
+        assistant_id=ASSIST_ID,
+        instructions="Пожалуйста, дайте конструктивный ответ на сообщение."
+    )
+
+    messages = client.beta.threads.messages.list(thread_id=thread_id)
+    message_source = json.loads(messages.model_dump_json())
+    answer = message_source['data'][0]['content'][0]['text']['value']
+    return answer
+
+async def send_messages(chat_id: int, answer: str) -> None:
+    try:
+        await client.send_message(chat_id, answer)
+    except Exception as e:
+        print(f"Ошибка при отправке сообщения: {e}")
+
+def register_handlers(client: TelegramClient) -> None:
+    client.add_event_handler(handle_new_messages, events.NewMessage())
+
+
+async def main() -> None:
+    await client.start()
+    print("Бот запущен и слушает новые сообщения...")
+
+    register_handlers(client)
+    await client.run_until_disconnected()
+
+if __name__ == '__main__':
+    import asyncio
+    asyncio.run(main())
